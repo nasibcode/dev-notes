@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Swift 6 Concurrency — Medium paste</title>
+<style>body{font-family:Georgia,serif;max-width:720px;margin:2rem auto;line-height:1.6;} pre{background:#f6f8fa;padding:1rem;overflow-x:auto;} code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.9em;} blockquote{border-left:4px solid #ccc;margin:1rem 0;padding-left:1rem;color:#444;} table{border-collapse:collapse;width:100%;margin:1rem 0;} th,td{border:1px solid #ddd;padding:0.5rem;text-align:left;}</style>
+</head>
+<body>
+<!-- Open in browser: Select All, Copy, paste into Medium. If formatting drops, paste into Google Docs first, then copy into Medium. -->
+<h1>Swift 6 Concurrency on iOS: From async/await to Strict Isolation (A Practical Guide)</h1>
+<p></p>
+<p><em>MainActor, custom global actors, actors, <code>Sendable</code>, and structured concurrency—explained from beginner to advanced, with real app-shaped examples.</em></p>
+<p></p>
+<blockquote>
+<p><strong>Who this is for</strong></p>
+<ul>
+<li>You write iOS apps (SwiftUI or UIKit) and you’re using Swift concurrency day-to-day.</li>
+<li>You’re adopting <strong>Swift 6 strict concurrency checking</strong>, or you’re already seeing <code>Sendable</code> / actor-isolation warnings.</li>
+<li>You want a clear beginner → advanced path, plus practical patterns you can apply immediately.</li>
+</ul>
+</blockquote>
+<p></p>
+<blockquote>
+<p><strong>Tested with</strong></p>
+<ul>
+<li>Swift <strong>6.x</strong> with <strong>Swift 6 language mode</strong> (or stricter), and a <strong>recent Xcode + iOS SDK</strong>—Apple continues to tighten UIKit/SwiftUI concurrency annotations across SDK releases, so treat dates as approximate and verify in your toolchain.</li>
+<li>UIKit: Apple’s API reference declares <a href="https://developer.apple.com/documentation/uikit/uiviewcontroller"><code>UIViewController</code></a> as <strong><code>@MainActor</code></strong>, so typical lifecycle overrides run on the main actor unless you opt out with something like <code>nonisolated</code>.</li>
+<li>Always cross-check with <a href="https://www.swift.org/documentation/concurrency/">Swift.org Concurrency docs</a>, Apple’s <em>The Swift Programming Language</em> (Concurrency chapter), and the UIKit symbol docs for the SDK you ship against.</li>
+</ul>
+</blockquote>
+<p></p>
+<hr>
+<p></p>
+<h2>Overview</h2>
+<p></p>
+<p>Swift 6 strict concurrency targets <strong>data races</strong>: unsynchronized access to the same mutable state from more than one concurrent context. The model gives you <strong>isolation</strong> (actors, global actors, MainActor) and <strong><code>Sendable</code> boundaries</strong> so values moved across tasks stay safe.</p>
+<p></p>
+<p>This article uses one continuous <strong>Dashboard</strong> story: loading profile, settings, feature flags, recommendations, and avatar thumbnails with caching. Each part adds one layer; later sections assume earlier ideas.</p>
+<p></p>
+<p><strong>Quick reference</strong></p>
+<p></p>
+<ul>
+<li><strong><code>@MainActor</code></strong> — UI and UI-bound state only; keep decode, CPU work, and disk I/O off the main actor.</li>
+<li><strong><code>actor</code></strong> — One serial executor per instance; keep mutable state inside; don’t leak live mutable references.</li>
+<li><strong><code>@globalActor</code></strong> — One shared lane for a subsystem—powerful, but a choke point; don’t park unrelated work there.</li>
+<li><strong><code>Sendable</code></strong> — Prefer immutable value types at boundaries; <code>@unchecked Sendable</code> only with a real safety story.</li>
+<li><strong>Structured concurrency</strong> — <code>async let</code> for a fixed set of parallel calls; <code>TaskGroup</code> when <em>N</em> is dynamic; <code>Task {}</code> to bridge from sync; avoid <code>Task.detached</code> unless you intend to drop parent cancellation and actor context.</li>
+<li><strong>Cancellation</strong> — Cooperative—use cancel-aware APIs, <code>Task.checkCancellation()</code> in loops, and cancel work when the screen goes away.</li>
+</ul>
+<p></p>
+<p><strong>How to read the examples:</strong> Code is shown in a particular shape so the <strong>compiler can check</strong> actor isolation and <code>Sendable</code> rules, and so <strong>runtime behavior</strong> (cancellation, main-thread UI updates) stays predictable. Throughout the parts below, short notes explain <strong>why</strong> that pattern is used and <strong>what advantage</strong> it buys you in a real app—so you can adapt the ideas without copying blindly.</p>
+<p></p>
+<hr>
+<p></p>
+<h3>Part 0 — Mental model (and why Swift 6 is strict)</h3>
+<p></p>
+<ul>
+<li>A <strong>data race</strong> is unsynchronized access to the same mutable state from multiple concurrent contexts (at least one write). These bugs can be rare and flaky.</li>
+<li>A <strong>thread</strong> is an OS execution concept; an <strong>actor</strong> is a language-level isolation domain with a serial executor. Code often “hops” executors at <code>await</code>—that’s normal.</li>
+</ul>
+<p></p>
+<p><strong>Red flags everywhere in concurrent code:</strong> heavy work on MainActor, unbounded <code>TaskGroup</code> fan-out, locks held across <code>await</code>, <code>@unchecked Sendable</code> without justification, and actor methods that suspend halfway through an invariant.</p>
+<p></p>
+<p>We’ll build: <strong>Dashboard</strong> loading profile, settings, flags, a list of recommended items, and cached avatar thumbnails.</p>
+<p></p>
+<p><strong>Summary:</strong> Strict checking is not pedantry—it turns “maybe racy” code into <strong>compile-time errors</strong> so you fix boundaries before users hit flaky crashes. The Dashboard thread ties every later section to the same mental model: <em>who owns state, and which task is allowed to touch it?</em></p>
+<p></p>
+<hr>
+<p></p>
+<h3>Part 1 — Foundations: tasks, suspension, cancellation</h3>
+<p></p>
+<p><strong>Structured vs unstructured tasks</strong></p>
+<p></p>
+<ul>
+<li>Prefer <strong>structured</strong> concurrency: child tasks live and die with the parent.</li>
+<li>Use unstructured <code>Task {}</code> when bridging from sync (buttons, delegates).</li>
+<li>Use <code>Task.detached</code> rarely—it severs parent/child relationships, including cancellation and priority, and easily breaks MainActor context.</li>
+</ul>
+<p></p>
+<p><strong>Why it matters:</strong> When child tasks are tied to a parent, <strong>cancellation and errors propagate in one direction</strong>—if the user leaves the screen, you cancel once and the whole subtree stops. <code>Task.detached</code> opts out of that tree, so you lose those guarantees unless you rebuild them by hand. <strong>Advantage of staying structured:</strong> less orphaned work, fewer “UI updated after dealloc” bugs, and priority/cancellation behavior that matches user expectations.</p>
+<p></p>
+<p><strong>Wrong pattern:</strong> using <code>Task.detached</code> for routine UI-driven work.</p>
+<p></p>
+<pre><code class="language-swift">@MainActor
+func refresh(api: API) {
+    Task.detached {
+        let data = try await api.fetchDashboard()
+        self.render(data) // UI update from a detached task — wrong
+    }
+}</code></pre>
+<p></p>
+<p><strong>Why the detached version is wrong:</strong> <code>Task.detached</code> runs in a fresh context, so it is <strong>not</strong> guaranteed to inherit the caller’s actor isolation. Updating <code>self</code> from there fights the MainActor rules and makes it easy to touch UI off the main thread. <strong>Better approach:</strong> use <code>Task { }</code> (inherits context from the creation site) or call async APIs from an already-<code>@MainActor</code> method so UI updates stay on the main actor.</p>
+<p></p>
+<p><strong>Cancellable screen load</strong></p>
+<p></p>
+<p>In SwiftUI, start work in <code>.task</code>—it’s cancelled when the view disappears.</p>
+<p></p>
+<p><strong>Why <code>.task</code>:</strong> It binds the async work’s lifetime to the <strong>view’s lifetime</strong>. When the view leaves the hierarchy, SwiftUI cancels the task—no extra plumbing. <strong>Advantage:</strong> you get automatic teardown for navigation and tab switches, which is exactly when you want to stop network and decoding work.</p>
+<p></p>
+<pre><code class="language-swift">import SwiftUI
+import Observation
+
+struct DashboardView: View {
+    @State private var vm = DashboardViewModel()
+
+    var body: some View {
+        content
+            .task { await vm.load() }
+    }
+}</code></pre>
+<p></p>
+<p><strong>SwiftUI + Observation:</strong> With an <code>@Observable</code> class, use <strong><code>@State</code></strong> to hold the view model; SwiftUI tracks changes to its properties without <code>ObservableObject</code> or <code>@StateObject</code>.</p>
+<p></p>
+<p>In UIKit, own a <code>Task</code> and cancel when the view controller’s content should stop loading (usually when the screen is going away).</p>
+<p></p>
+<p><strong>UIKit + MainActor (current docs):</strong> <a href="https://developer.apple.com/documentation/uikit/uiviewcontroller"><code>UIViewController</code></a> is annotated <strong><code>@MainActor</code></strong>. A <code>Task { … }</code> created from <code>viewDidLoad</code>, <code>viewIsAppearing</code>, or other main-actor lifecycle methods <strong>inherits that main actor context</strong>, so <code>await</code> does not move UI updates off the main actor the way <code>Task.detached</code> would.</p>
+<p></p>
+<pre><code class="language-swift">final class DashboardViewController: UIViewController {
+    private var loadTask: Task&lt;Void, Never&gt;?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        loadTask = Task { [weak self] in
+            await self?.loadDashboard()
+        }
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        loadTask?.cancel()
+    }
+
+    private func loadDashboard() async {
+        // Same async load you would trigger from a view model / coordinator.
+    }
+}</code></pre>
+<p></p>
+<p>If your load depends on <strong>accurate view geometry or trait collections</strong>, Apple recommends doing that work from <a href="https://developer.apple.com/documentation/uikit/uiviewcontroller/viewisappearing(_:"><code>viewIsAppearing(_:)</code></a>) rather than <code>viewWillAppear</code>; the <strong><code>Task</code> + cancel</strong> pattern stays the same—only the callback you start from changes.</p>
+<p></p>
+<p><strong>Why UIKit stores a <code>Task</code>:</strong> There is no SwiftUI-style <code>.task</code> modifier, so you <strong>own</strong> the handle and cancellation policy. Cancelling from a <strong>disappear</strong> callback mirrors SwiftUI’s “work tied to visibility” idea: <strong>advantage</strong>—in-flight loads stop when the user navigates away, so you waste less work and avoid applying results after teardown.</p>
+<p></p>
+<p><strong>Lifecycle nuance (worth reading once):</strong> <code>viewWillDisappear</code> also runs when another screen <strong>covers</strong> yours (for example a full-screen modal). If that incorrectly cancels background prefetch, gate cancellation with flags or checks such as <code>isMovingFromParent</code>, <code>isBeingDismissed</code>, or your navigation stack state—or cancel from a coordinator that knows the real “user left this feature” moment. Apple’s overview discusses pairing work started in <code>will</code> callbacks with the matching <code>did</code> / opposite <code>will</code> transitions; see <a href="https://developer.apple.com/documentation/uikit/uiviewcontroller/viewisappearing(_:"><code>viewIsAppearing(_:)</code></a>) and related lifecycle topics in the same <code>UIViewController</code> documentation.</p>
+<p></p>
+<p><strong>About <code>deinit</code>:</strong> Calling <code>loadTask?.cancel()</code> there is synchronous and sometimes used as a backstop, but <strong><code>deinit</code> can run later than you think</strong>, so prefer explicit lifecycle cancellation for predictable behavior under Swift 6’s stricter isolation story.</p>
+<p></p>
+<p><strong>Cancellation is cooperative</strong>—it doesn’t stop your code by itself. Use cancel-aware APIs and/or <code>try Task.checkCancellation()</code> / <code>Task.isCancelled</code> in loops.</p>
+<p></p>
+<p><strong>Why cooperative cancellation:</strong> <code>cancel()</code> only sets a flag; your code must <strong>observe</strong> it between steps. <strong>Advantage:</strong> you can stop <em>before</em> the next expensive call (or exit a long loop) instead of relying on force-kill semantics that don’t exist in Swift tasks. Checking in a <code>for</code> loop is the standard way to keep downloads and batch work responsive to navigation.</p>
+<p></p>
+<pre><code class="language-swift">func downloadMany(urls: [URL]) async throws -&gt; [Data] {
+    var result: [Data] = []
+    for url in urls {
+        try Task.checkCancellation()
+        let (data, _) = try await URLSession.shared.data(from: url)
+        result.append(data)
+    }
+    return result
+}</code></pre>
+<p></p>
+<pre><code class="language-swift">loadTask?.cancel()
+
+try Task.checkCancellation()
+
+do {
+    let snapshot = try await service.loadSnapshot()
+    // use snapshot
+} catch is CancellationError {
+    // expected when user navigates away
+} catch {
+    // show error / retry
+}</code></pre>
+<p></p>
+<p><strong>Summary (Part 1):</strong> Prefer APIs that participate in the <strong>task tree</strong> (<code>.task</code>, stored <code>Task</code>, structured <code>async</code> entry points). Cancel when the screen goes away, and <strong>poll cancellation</strong> in long work. You gain predictable teardown and fewer stray updates after the user has already moved on.</p>
+<p></p>
+<hr>
+<p></p>
+<h3>Part 2 — MainActor: UI as a serial domain</h3>
+<p></p>
+<p>If it touches UIKit/SwiftUI or UI-bound state, it belongs on the <strong>main actor</strong>.</p>
+<p></p>
+<p><strong>Why <code>@MainActor</code> on the view model:</strong> UI frameworks expect mutations on the <strong>main thread</strong>. Marking the type <code>@MainActor</code> makes that contract <strong>explicit to the compiler</strong>: any method on <code>DashboardViewModel</code> runs on the main executor unless you opt out. With <strong><code>@Observable</code></strong>, plain stored properties (here <code>state</code>) drive SwiftUI updates—no <code>ObservableObject</code> / <code>@Published</code> boilerplate. <strong>Advantage:</strong> UI reads and mutations stay on the main actor and stay in sync with rendering—no manual <code>DispatchQueue.main.async</code> scatter.</p>
+<p></p>
+<pre><code class="language-swift">import Observation
+
+@MainActor
+@Observable
+final class DashboardViewModel {
+    enum State {
+        case idle
+        case loading
+        case loaded(DashboardSnapshot)
+        case failed(String)
+    }
+
+    private(set) var state: State = .idle
+
+    private let service = DashboardService()
+
+    func load() async {
+        state = .loading
+        do {
+            let snapshot = try await service.loadSnapshot()
+            state = .loaded(snapshot)
+        } catch {
+            state = .failed(String(describing: error))
+        }
+    }
+}</code></pre>
+<p></p>
+<p><code>load()</code> is <code>async</code> so it can <strong>await</strong> the service without blocking the thread—but the view model itself stays on MainActor, so assigning <code>state</code> after the await remains a safe UI update.</p>
+<p></p>
+<p><strong>Don’t do heavy work on MainActor:</strong> large JSON decode, image resize, disk I/O. Do that work in a nonisolated service or actor, return a <strong><code>Sendable</code> snapshot</strong>, then assign UI state on MainActor.</p>
+<p></p>
+<p><strong>Why move work off MainActor:</strong> The main executor also drives <strong>layout and animations</strong>. CPU-heavy or I/O-heavy work there competes with frames and causes hitches. <strong>Advantage of a service + snapshot:</strong> decoding and networking run where they can’t starve scrolling; you only hop to MainActor to <strong>commit</strong> a small, ready-to-render model.</p>
+<p></p>
+<pre><code class="language-swift">struct DashboardSnapshot: Sendable {
+    let profile: ProfileDTO
+    let settings: SettingsDTO
+    let flags: FlagsDTO
+    let recommendations: [RecommendationDTO]
+}</code></pre>
+<p></p>
+<p><code>DashboardSnapshot</code> is a <strong>value type</strong> marked <code>Sendable</code> so it can cross from background/async work into the MainActor-bound view model <strong>without</strong> the compiler complaining about shared mutable state.</p>
+<p></p>
+<p><strong>Practical split:</strong> isolate the view model with <code>@MainActor</code>; from elsewhere, <code>await MainActor.run { }</code> for UI writes.</p>
+<p></p>
+<pre><code class="language-swift">import Observation
+
+@MainActor
+@Observable
+final class MyViewModel {
+    private(set) var title = &quot;&quot;
+
+    func setTitle(_ t: String) {
+        title = t
+    }
+}</code></pre>
+<p></p>
+<p><strong>Summary (Part 2):</strong> MainActor is your <strong>single-writer lane for UI</strong>. Keep it for <strong>state and UI calls</strong>, not for bulk work. You gain smoother scrolling and simpler reasoning: “if it’s in the view model, it’s main-thread safe.”</p>
+<p></p>
+<hr>
+<p></p>
+<h3>Part 3 — Global actors: subsystem-wide serial access</h3>
+<p></p>
+<p>An <code>actor</code> isolates per-instance state. A <strong>global actor</strong> isolates a whole subsystem behind one shared executor. Use it when you have a shared resource (preferences, a cache directory, DB access) and want <strong>one</strong> serialized lane app-wide.</p>
+<p></p>
+<p><strong>Why not a plain class with <code>DispatchQueue</code>:</strong> A global actor gives you the <strong>same await-based isolation</strong> as other Swift concurrency features—the compiler enforces crossings. <strong>Advantage:</strong> call sites show <code>await</code> when changing subsystems, which documents contention and prevents “forgot to dispatch to the queue” mistakes.</p>
+<p></p>
+<pre><code class="language-swift">@globalActor
+enum PreferencesActor {
+    actor ActorType {}
+    static let shared = ActorType()
+}
+
+@PreferencesActor
+final class PreferencesStore {
+    private let defaults: UserDefaults = .standard
+
+    func setLastSeenDashboardVersion(_ v: Int) {
+        defaults.set(v, forKey: &quot;lastSeenDashboardVersion&quot;)
+    }
+
+    func lastSeenDashboardVersion() -&gt; Int {
+        defaults.integer(forKey: &quot;lastSeenDashboardVersion&quot;)
+    }
+}</code></pre>
+<p></p>
+<p>Callers must <code>await</code> when crossing isolation; you can reason “preferences code runs on <code>PreferencesActor</code>.”</p>
+<p></p>
+<p><strong>Trade-off:</strong> One global lane means <strong>everything</strong> on that actor serializes together—good for safety around a shared resource, bad if you pile unrelated slow work onto it. <strong>Avoid</strong> marking unrelated types with the same global actor just to serialize random work—that creates an artificial bottleneck. If you only need per-instance serialization, use an instance <code>actor</code> instead.</p>
+<p></p>
+<p><strong>Summary (Part 3):</strong> Use a global actor when the <strong>subsystem</strong> truly shares one resource and one ordering story. You gain enforced boundaries and clear mental ownership; you pay <strong>throughput</strong> if you misuse the lane for unrelated tasks.</p>
+<p></p>
+<hr>
+<p></p>
+<h3>Part 4 — Actors: shared mutable state (and reentrancy)</h3>
+<p></p>
+<p>Actors serialize access to mutable state.</p>
+<p></p>
+<p><strong>Why an <code>actor</code> for a cache:</strong> Multiple screens or tasks might request avatars at once. A class plus manual locking works, but an actor makes <strong>exclusive access</strong> the default and pushes callers through <code>await</code>, which surfaces contention in the type system. <strong>Advantage:</strong> fewer forgotten lock paths, and cache mutations stay in one place the compiler can reason about.</p>
+<p></p>
+<pre><code class="language-swift">actor AvatarCache {
+    private var inMemory: [URL: Data] = [:]
+
+    func cachedAvatar(for url: URL) -&gt; Data? {
+        inMemory[url]
+    }
+
+    func insert(_ data: Data, for url: URL) {
+        inMemory[url] = data
+    }
+}</code></pre>
+<p></p>
+<p><strong>Reentrancy:</strong> if an actor method hits <code>await</code>, it can suspend and other work can run on that actor before it resumes—serialized, but your <em>logical</em> invariants might still break if you assumed “nothing else runs until I return.”</p>
+<p></p>
+<p><strong>Why this surprises people:</strong> Actor isolation prevents two functions from mutating stored properties <strong>at the same time</strong>, but it does <strong>not</strong> mean your multi-step <em>algorithm</em> runs atomically across an <code>await</code>. <strong>Advantage of knowing this:</strong> you design “decide and mutate” steps without suspension in the middle, and push networking/analytics to <strong>after</strong> the critical section.</p>
+<p></p>
+<p><strong>Wrong pattern:</strong> updating state, then <code>await</code>, then assuming nothing changed.</p>
+<p></p>
+<pre><code class="language-swift">actor BankAccount {
+    private var balance: Int = 0
+
+    func withdraw(_ amount: Int) async throws {
+        guard amount &gt; 0 else { return }
+        guard balance &gt;= amount else { throw NSError(domain: &quot;InsufficientFunds&quot;, code: 1) }
+        balance -= amount
+        try await Task.sleep(nanoseconds: 10_000_000) // other withdrawals can interleave here
+    }
+}</code></pre>
+<p></p>
+<p><strong>Better:</strong> keep invariant updates in non-suspending actor methods; do async side effects after.</p>
+<p></p>
+<pre><code class="language-swift">actor BankAccount {
+    private var balance: Int = 0
+
+    func deposit(_ amount: Int) {
+        guard amount &gt; 0 else { return }
+        balance += amount
+    }
+
+    func withdraw(_ amount: Int) throws {
+        guard amount &gt; 0 else { return }
+        guard balance &gt;= amount else { throw NSError(domain: &quot;InsufficientFunds&quot;, code: 1) }
+        balance -= amount
+    }
+}
+
+func withdrawAndNotify(account: BankAccount, amount: Int) async {
+    do {
+        try account.withdraw(amount)
+        // await analytics, network, etc. after the atomic mutation
+    } catch { }
+}</code></pre>
+<p></p>
+<p>The synchronous <code>withdraw</code> completes the balance change <strong>before</strong> any suspension, so no other actor call can observe a half-finished withdrawal.</p>
+<p></p>
+<p><strong>Avatar fetch (safe shape):</strong> network outside cache mutations so you don’t hold invariants across unrelated <code>await</code>s.</p>
+<p></p>
+<pre><code class="language-swift">struct AvatarResult: Sendable {
+    let url: URL
+    let data: Data
+}
+
+actor AvatarRepository {
+    private let cache = AvatarCache()
+
+    func avatar(for url: URL) async throws -&gt; AvatarResult {
+        if let cached = await cache.cachedAvatar(for: url) {
+            return AvatarResult(url: url, data: cached)
+        }
+
+        let (data, _) = try await URLSession.shared.data(from: url)
+        await cache.insert(data, for: url)
+        return AvatarResult(url: url, data: data)
+    }
+}</code></pre>
+<p></p>
+<p><strong>Why this order:</strong> Fetch from the network <strong>before</strong> <code>await cache.insert</code>—the slow <code>URLSession</code> await is not sandwiched inside a half-updated cache invariant. <strong>Advantage:</strong> simpler reasoning and fewer reentrancy footguns in real caches that also touch disk or eviction logic.</p>
+<p></p>
+<p><strong>Don’t leak mutable internals</strong> from an actor (e.g. returning a shared mutable box). Expose async methods or value snapshots only.</p>
+<p></p>
+<p><strong>Summary (Part 4):</strong> Actors give <strong>serial access</strong> to mutable state; reentrancy means you still design <strong>short critical sections</strong>. For shared caches, keep mutations in the actor and pass <strong><code>Sendable</code> results</strong> outward.</p>
+<p></p>
+<hr>
+<p></p>
+<h3>Part 5 — <code>Sendable</code>: safe boundaries (Swift 6 strict checking)</h3>
+<p></p>
+<p>Pass <strong>immutable value types</strong> across concurrency boundaries when you can.</p>
+<p></p>
+<p><strong>Why <code>Sendable</code> on DTOs:</strong> Under Swift 6, values that cross tasks/actors must be provably safe to share. Immutable structs with <code>Sendable</code> <strong>document</strong> that contract and satisfy the checker. <strong>Advantage:</strong> the compiler catches accidental use of a non-Sendable reference type across boundaries, which is where data races often start.</p>
+<p></p>
+<pre><code class="language-swift">struct ProfileDTO: Decodable, Sendable {
+    let id: String
+    let displayName: String
+}
+
+struct SettingsDTO: Decodable, Sendable {
+    let prefersReducedMotion: Bool
+}
+
+struct FlagsDTO: Decodable, Sendable {
+    let enableNewDashboard: Bool
+}
+
+struct RecommendationDTO: Decodable, Sendable {
+    let id: String
+    let title: String
+}</code></pre>
+<p></p>
+<p><code>@unchecked Sendable</code> is a manual promise—require a real synchronization story in review.</p>
+<p></p>
+<p>If you depend on legacy modules without concurrency annotations, <code>@preconcurrency import</code> can be a migration bridge, not a permanent excuse to ignore boundaries.</p>
+<p></p>
+<p><strong>Summary (Part 5):</strong> Treat boundaries like <strong>message passing</strong>: send <strong>copies</strong> (<code>struct</code> DTOs), not shared mutable objects. You gain compile-time checking today and safer refactors tomorrow.</p>
+<p></p>
+<hr>
+<p></p>
+<h3>Part 6 — <code>async let</code>: fixed parallel work (dashboard fan-out)</h3>
+<p></p>
+<p>Use <code>async let</code> when the number of parallel operations is fixed and independent.</p>
+<p></p>
+<p><strong>Why <code>async let</code> here:</strong> Profile, settings, flags, and recommendations are <strong>independent</strong> requests. Starting them with <code>async let</code> runs them <strong>concurrently</strong> up to the await that combines them. <strong>Advantage:</strong> lower wall-clock time than four sequential <code>await</code>s, without the boilerplate of a task group for a fixed, known count.</p>
+<p></p>
+<pre><code class="language-swift">struct DashboardService {
+    func loadSnapshot() async throws -&gt; DashboardSnapshot {
+        async let profile = fetchProfile()
+        async let settings = fetchSettings()
+        async let flags = fetchFlags()
+        async let recs = fetchRecommendations()
+
+        return try await DashboardSnapshot(
+            profile: profile,
+            settings: settings,
+            flags: flags,
+            recommendations: recs
+        )
+    }
+
+    func fetchProfile() async throws -&gt; ProfileDTO { ProfileDTO(id: &quot;1&quot;, displayName: &quot;Taylor&quot;) }
+    func fetchSettings() async throws -&gt; SettingsDTO { SettingsDTO(prefersReducedMotion: false) }
+    func fetchFlags() async throws -&gt; FlagsDTO { FlagsDTO(enableNewDashboard: true) }
+    func fetchRecommendations() async throws -&gt; [RecommendationDTO] {
+        [
+            RecommendationDTO(id: &quot;r1&quot;, title: &quot;Structured concurrency patterns&quot;),
+            RecommendationDTO(id: &quot;r2&quot;, title: &quot;Actor isolation pitfalls&quot;),
+        ]
+    }
+}</code></pre>
+<p></p>
+<p>If you start an <code>async let</code>, you should <strong>await</strong> it. Decide what happens when one of the parallel operations fails (<code>try await</code> on the combined tuple typically fails fast on the first error—which is often what you want for a single “load dashboard” operation).</p>
+<p></p>
+<p><strong>Summary (Part 6):</strong> Use <code>async let</code> for <strong>fixed fan-out</strong> of independent async calls. You gain parallelism with <strong>structured</strong> child tasks tied to the same parent scope.</p>
+<p></p>
+<hr>
+<p></p>
+<h3>Part 7 — <code>TaskGroup</code>: dynamic parallel work (N items)</h3>
+<p></p>
+<p>Use <code>TaskGroup</code> when task count depends on runtime data.</p>
+<p></p>
+<p><strong>Why not <code>async let</code> in a loop:</strong> You cannot write <code>async let</code> dynamically for <em>N</em> items without knowing <em>N</em> at compile time in a fixed form. <code>withThrowingTaskGroup</code> (or <code>withTaskGroup</code>) exists so you can <strong>add tasks in a loop</strong> and collect results. <strong>Advantage:</strong> one pattern for “one child task per id/url/item” with clear parent/child structure.</p>
+<p></p>
+<pre><code class="language-swift">func fetchRecommendationsDetails(ids: [String]) async throws -&gt; [RecommendationDTO] {
+    try await withThrowingTaskGroup(of: RecommendationDTO.self) { group in
+        for id in ids {
+            group.addTask {
+                try await fetchRecommendation(id: id)
+            }
+        }
+
+        var items: [RecommendationDTO] = []
+        for try await item in group {
+            items.append(item)
+        }
+        return items
+    }
+}</code></pre>
+<p></p>
+<blockquote>
+<p><code>fetchRecommendation(id:)</code> stands in for your real <code>async throws</code> API returning a <code>Sendable</code> DTO.</p>
+</blockquote>
+<p></p>
+<p><strong>Bounded parallelism:</strong> for large <code>ids</code>, don’t launch unbounded concurrent work—chunk IDs and run each chunk in a group, with <code>Task.checkCancellation()</code> between chunks.</p>
+<p></p>
+<pre><code class="language-swift">func chunks&lt;T&gt;(_ items: [T], size: Int) -&gt; [[T]] {
+    guard size &gt; 0 else { return [items] }
+    return stride(from: 0, to: items.count, by: size).map {
+        Array(items[$0..&lt;min($0 + size, items.count)])
+    }
+}
+
+func fetchAllThumbnailsBounded(ids: [String], maxConcurrent: Int = 4) async throws -&gt; [Data] {
+    var all: [Data] = []
+    for batch in chunks(ids, size: maxConcurrent) {
+        try Task.checkCancellation()
+        let batchResult = try await withThrowingTaskGroup(of: Data.self) { group in
+            for id in batch {
+                group.addTask { try await fetchThumbnail(id: id) }
+            }
+            var partial: [Data] = []
+            for try await data in group { partial.append(data) }
+            return partial
+        }
+        all.append(contentsOf: batchResult)
+    }
+    return all
+}</code></pre>
+<p></p>
+<p>Unbounded fan-out can overload the network, hit rate limits, spike memory, and hurt cancellation—same policy applies to any dynamic list (recommendations, thumbnails, assets). Extract <code>chunks</code> once and reuse.</p>
+<p></p>
+<p><strong>Summary (Part 7):</strong> Use <code>TaskGroup</code> for <strong>dynamic N</strong>; add <strong>chunking</strong> when N can be large. You gain controlled resource use, better behavior on cellular networks, and cancellation that stops future batches instead of already-queued storms.</p>
+<p></p>
+<hr>
+<p></p>
+<h3>Part 8 — Putting it together (architecture)</h3>
+<p></p>
+<p>This is the <strong>layering</strong> the previous parts were building toward:</p>
+<p></p>
+<ul>
+<li><code>@MainActor</code> <strong>DashboardViewModel</strong> owns UI state—one <code>@Observable</code> type for screen fields and logic on the main actor (SwiftUI holds it with <code>@State</code>).</li>
+<li>Nonisolated <strong>DashboardService</strong> loads snapshots with <code>async let</code> / <code>TaskGroup</code>—networking and decoding stay off the UI lane but still run inside structured tasks you can cancel.</li>
+<li>Shared mutable caches sit behind <strong>actors</strong>—a single serial writer for cache state.</li>
+<li>Subsystem-wide serialized access uses <strong>global actors</strong> when justified—for example one app-wide preferences lane.</li>
+<li>Data crossing boundaries is <strong><code>Sendable</code> DTOs</strong>—messages between layers are <strong>values</strong>, not shared mutable objects.</li>
+</ul>
+<p></p>
+<p><strong>Why this split matters:</strong> Each layer has <strong>one job</strong> and explicit <strong>crossing points</strong> (<code>await</code>, <code>Sendable</code> types). <strong>Advantage:</strong> Swift 6 checking stays tractable, you can test services and actors without the full UI stack, and you can swap storage implementations without rewriting the view model.</p>
+<p></p>
+<hr>
+<p></p>
+<h2>Advanced edge cases (production patterns)</h2>
+<p></p>
+<p>Patterns you see often in real apps, each with one <strong>rule</strong> to remember.</p>
+<p></p>
+<h3>1. Callbacks → <code>async</code>/<code>await</code> (continuations)</h3>
+<p></p>
+<p><strong>Rule:</strong> Call <code>resume</code> on the continuation <strong>exactly once</strong>—never zero times (caller hangs) and never twice (crash / undefined behavior).</p>
+<p></p>
+<p><code>withCheckedThrowingContinuation</code> wraps a callback API: when the callback fires, you resume with the result. Treat it like a promise: one completion path only.</p>
+<p></p>
+<pre><code class="language-swift">func fetchThing(_ api: LegacyAPI) async throws -&gt; Thing {
+    try await withCheckedThrowingContinuation { cont in
+        api.fetch { result in cont.resume(with: result) }
+        // Wrong: calling resume again on another code path (double resume)
+    }
+}</code></pre>
+<p></p>
+<h3>2. <code>AsyncStream</code> — clean up when the consumer stops</h3>
+<p></p>
+<p><strong>Rule:</strong> If you register for notifications, KVO, or timers inside the stream, use <code>continuation.onTermination</code> to <strong>unregister</strong> when nobody is listening anymore.</p>
+<p></p>
+<p>Without cleanup, the observer keeps firing after the <code>for await</code> loop ended—wasted work and possible retain cycles.</p>
+<p></p>
+<pre><code class="language-swift">func notifications() -&gt; AsyncStream&lt;String&gt; {
+    AsyncStream { continuation in
+        let token = NotificationCenter.default.addObserver(
+            forName: .init(&quot;Ping&quot;), object: nil, queue: nil
+        ) { _ in
+            continuation.yield(&quot;ping&quot;)
+        }
+
+        continuation.onTermination = { _ in
+            NotificationCenter.default.removeObserver(token)
+            continuation.finish()
+        }
+    }
+}</code></pre>
+<p></p>
+<h3>3. Swift cancellation vs legacy cancellation</h3>
+<p></p>
+<p><strong>Rule:</strong> <code>Task.cancel()</code> only marks the Swift task as cancelled. It does <strong>not</strong> automatically cancel a <code>URLSessionDataTask</code>, a custom HTTP client, or a vendor SDK—you must call their <code>cancel</code> yourself.</p>
+<p></p>
+<p><code>withTaskCancellationHandler</code> runs your <code>onCancel</code> closure when the task is cancelled, so you can tear down the legacy request at the same time.</p>
+<p></p>
+<pre><code class="language-swift">func fetchCancellable(_ api: LegacyAPI) async throws -&gt; Data {
+    let request = api.makeRequest()
+    return try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { cont in
+            request.start { result in
+                cont.resume(with: result)
+            }
+        }
+    } onCancel: {
+        request.cancel()
+    }
+}</code></pre>
+<p></p>
+<h3>4. Do not <code>await</code> while holding a lock</h3>
+<p></p>
+<p><strong>Rule:</strong> Do not call <code>await</code> between <code>lock()</code> and <code>unlock()</code> on <code>NSLock</code>, inside <code>DispatchQueue.sync</code>, or while holding a semaphore. While you are suspended, other code can run and try to take the same lock → <strong>deadlock</strong>.</p>
+<p></p>
+<p><strong>Fix:</strong> <code>await</code> first (network, disk), then update shared state on an <strong>actor</strong> or after you have released the lock.</p>
+<p></p>
+<pre><code class="language-swift">final class LockedStore {
+    private let lock = NSLock()
+    private var ids: [Int] = []
+
+    func refresh(api: API) async throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let more = try await api.fetchIDs() // WRONG: await while locked
+        ids.append(contentsOf: more)
+    }
+}</code></pre>
+<p></p>
+<pre><code class="language-swift">actor IDStore {
+    private var ids: [Int] = []
+    func append(contentsOf more: [Int]) { ids.append(contentsOf: more) }
+}
+
+func refresh(store: IDStore, api: API) async throws {
+    let more = try await api.fetchIDs()
+    await store.append(contentsOf: more)
+}</code></pre>
+<p></p>
+<h3>5. Task group: all results, not “fail the whole group”</h3>
+<p></p>
+<p><strong>Rule:</strong> <code>withThrowingTaskGroup</code> stops the whole group when <strong>one</strong> child throws. If you need “load many items, keep successes and record failures” (e.g. a grid of thumbnails), make each child return <code>Result&lt;Success, Error&gt;</code> and use a <strong>non-throwing</strong> <code>withTaskGroup</code> so every child can finish.</p>
+<p></p>
+<pre><code class="language-swift">func bestEffortLoad(ids: [Int], api: API) async -&gt; [Result&lt;ItemDTO, Error&gt;] {
+    await withTaskGroup(of: Result&lt;ItemDTO, Error&gt;.self) { group in
+        for id in ids {
+            group.addTask {
+                do { return .success(try await api.fetchItem(id: id)) }
+                catch { return .failure(error) }
+            }
+        }
+        var results: [Result&lt;ItemDTO, Error&gt;] = []
+        for await r in group { results.append(r) }
+        return results
+    }
+}</code></pre>
+<p></p>
+<h3>6. <code>AsyncStream</code> buffering — avoid huge queues</h3>
+<p></p>
+<p><strong>Rule:</strong> Default buffering can grow without bound if the producer is fast and the consumer is slow. For “latest value only” (location, download progress), use <code>.bufferingNewest(1)</code> so memory stays bounded and readers see the newest value, not a long backlog.</p>
+<p></p>
+<pre><code class="language-swift">func latestOnlyStream() -&gt; AsyncStream&lt;Int&gt; {
+    AsyncStream(Int.self, bufferingPolicy: .bufferingNewest(1)) { continuation in
+        for i in 0..&lt;10_000 { continuation.yield(i) }
+        continuation.finish()
+    }
+}</code></pre>
+<p></p>
+<h3>7. Timeout — two tasks, first wins</h3>
+<p></p>
+<p><strong>Rule:</strong> Start the real work and a <code>Task.sleep</code> in the same <code>withThrowingTaskGroup</code>. Whichever finishes first wins; then call <code>cancelAll()</code> so the loser stops (sleep wakes as cancelled, work can check cancellation).</p>
+<p></p>
+<pre><code class="language-swift">func withTimeout&lt;T: Sendable&gt;(
+    seconds: Double,
+    operation: @Sendable @escaping () async throws -&gt; T
+) async throws -&gt; T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            throw CancellationError()
+        }
+        let value = try await group.next()!
+        group.cancelAll()
+        return value
+    }
+}</code></pre>
+<p></p>
+<hr>
+<p></p>
+<h2>Resources</h2>
+<p></p>
+<ul>
+<li>Swift.org — Concurrency: https://www.swift.org/documentation/concurrency/</li>
+<li>Apple — <em>The Swift Programming Language</em>: Concurrency chapter</li>
+<li>Apple — <a href="https://developer.apple.com/documentation/uikit/uiviewcontroller"><code>UIViewController</code></a> (UIKit API reference; includes <code>@MainActor</code> declaration)</li>
+<li>Apple — <a href="https://developer.apple.com/tutorials/app-dev-training/adopting-swift-concurrency">Adopting Swift concurrency</a> (UIKit / app lifecycle–oriented tutorial)</li>
+<li>WWDC: https://developer.apple.com/videos/ (search “Swift Concurrency”, “Swift 6”, “UIKit”)</li>
+</ul>
+<p></p>
+<hr>
+<p></p>
+<p><em>Tags for Medium (paste in the story settings):</em> Swift 6, iOS concurrency, MainActor, actors, global actor, Sendable, async await, TaskGroup, structured concurrency, SwiftUI, UIKit, cancellation</p>
+</body>
+</html>
