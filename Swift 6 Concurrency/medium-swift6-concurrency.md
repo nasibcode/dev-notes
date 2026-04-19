@@ -520,28 +520,28 @@ This is the **layering** the previous parts were building toward:
 
 ## Advanced edge cases (production patterns)
 
-These sections cover patterns that show up in real codebases but need a **sharp rule**: bridging legacy callbacks, cleaning up subscriptions, and avoiding deadlocks when mixing locks with `await`.
+Patterns you see often in real apps, each with one **rule** to remember.
 
-### Bridging callbacks: continuations
+### 1. Callbacks → `async`/`await` (continuations)
 
-`withCheckedThrowingContinuation` adapts callback APIs to `async`/`await`. You must **resume exactly once** (twice is a bug; zero times hangs).
+**Rule:** Call `resume` on the continuation **exactly once**—never zero times (caller hangs) and never twice (crash / undefined behavior).
 
-**Why:** Legacy code invokes you on an arbitrary queue; the continuation **bridges** that into structured `async`/`await`. **Advantage:** you compose the same as first-class async APIs. The single-resume rule matches a well-formed callback: exactly one success or failure path.
+`withCheckedThrowingContinuation` wraps a callback API: when the callback fires, you resume with the result. Treat it like a promise: one completion path only.
 
 ```swift
 func fetchThing(_ api: LegacyAPI) async throws -> Thing {
     try await withCheckedThrowingContinuation { cont in
         api.fetch { result in cont.resume(with: result) }
-        // cont.resume(throwing: ...) here as well — wrong: double resume
+        // Wrong: calling resume again on another code path (double resume)
     }
 }
 ```
 
-### `AsyncStream` and cleanup
+### 2. `AsyncStream` — clean up when the consumer stops
 
-`AsyncStream` turns push-style events into `for await`. Use `onTermination` to unsubscribe and avoid leaks.
+**Rule:** If you register for notifications, KVO, or timers inside the stream, use `continuation.onTermination` to **unregister** when nobody is listening anymore.
 
-**Why:** NotificationCenter, KVO, and many SDKs are **callback-driven**; `AsyncStream` gives you a **pull** interface that composes with `for await` and task cancellation. **Advantage:** `onTermination` ties stream lifetime to consumer lifetime—you remove observers when the task stops listening, avoiding leaks and duplicate callbacks.
+Without cleanup, the observer keeps firing after the `for await` loop ended—wasted work and possible retain cycles.
 
 ```swift
 func notifications() -> AsyncStream<String> {
@@ -560,11 +560,11 @@ func notifications() -> AsyncStream<String> {
 }
 ```
 
-### Cancellation propagation + cleanup (`withTaskCancellationHandler`)
+### 3. Swift cancellation vs legacy cancellation
 
-When a Swift task cancels but legacy code keeps running, cancel the legacy work in `onCancel`.
+**Rule:** `Task.cancel()` only marks the Swift task as cancelled. It does **not** automatically cancel a `URLSessionDataTask`, a custom HTTP client, or a vendor SDK—you must call their `cancel` yourself.
 
-**Why:** `Task.cancel()` does not automatically call `URLSessionTask.cancel()` or your vendor SDK’s cancel—you wire that up. **Advantage:** when the user navigates away, **both** Swift’s cooperative cancellation and the legacy request stop, so you don’t waste bandwidth or resume continuations after nobody cares.
+`withTaskCancellationHandler` runs your `onCancel` closure when the task is cancelled, so you can tear down the legacy request at the same time.
 
 ```swift
 func fetchCancellable(_ api: LegacyAPI) async throws -> Data {
@@ -581,11 +581,11 @@ func fetchCancellable(_ api: LegacyAPI) async throws -> Data {
 }
 ```
 
-### Never hold locks across `await`
+### 4. Do not `await` while holding a lock
 
-Never `await` while holding `NSLock`, `DispatchQueue.sync`, or semaphores—use actors, or copy data out under the lock then `await`.
+**Rule:** Do not call `await` between `lock()` and `unlock()` on `NSLock`, inside `DispatchQueue.sync`, or while holding a semaphore. While you are suspended, other code can run and try to take the same lock → **deadlock**.
 
-**Why:** While you `await`, other code can run—including code that wants the **same** lock → classic deadlock. Swift’s model prefers **actors** for async-safe mutual exclusion. **Advantage:** the compiler models isolation; you don’t hold OS locks across suspension points.
+**Fix:** `await` first (network, disk), then update shared state on an **actor** or after you have released the lock.
 
 ```swift
 final class LockedStore {
@@ -595,7 +595,7 @@ final class LockedStore {
     func refresh(api: API) async throws {
         lock.lock()
         defer { lock.unlock() }
-        let more = try await api.fetchIDs() // WRONG
+        let more = try await api.fetchIDs() // WRONG: await while locked
         ids.append(contentsOf: more)
     }
 }
@@ -613,11 +613,9 @@ func refresh(store: IDStore, api: API) async throws {
 }
 ```
 
-### Best-effort task groups (partial results)
+### 5. Task group: all results, not “fail the whole group”
 
-`withThrowingTaskGroup` fails fast. To collect successes and failures, have children return `Result`.
-
-**Why:** Sometimes you want **all** outcomes (e.g. refresh a grid where some tiles fail). **Advantage:** one group pass yields a full `Result` array; callers decide whether to show partial data, retry failures, or surface errors per item.
+**Rule:** `withThrowingTaskGroup` stops the whole group when **one** child throws. If you need “load many items, keep successes and record failures” (e.g. a grid of thumbnails), make each child return `Result<Success, Error>` and use a **non-throwing** `withTaskGroup` so every child can finish.
 
 ```swift
 func bestEffortLoad(ids: [Int], api: API) async -> [Result<ItemDTO, Error>] {
@@ -635,9 +633,9 @@ func bestEffortLoad(ids: [Int], api: API) async -> [Result<ItemDTO, Error>] {
 }
 ```
 
-### Async sequence buffering
+### 6. `AsyncStream` buffering — avoid huge queues
 
-**Why `bufferingNewest(1)`:** Fast producers and slow consumers can otherwise grow an **unbounded** buffer and spike memory. Keeping only the latest value fits “current state” streams (location, progress). **Advantage:** bounded memory and UI that reflects the newest value, not a backlog.
+**Rule:** Default buffering can grow without bound if the producer is fast and the consumer is slow. For “latest value only” (location, download progress), use `.bufferingNewest(1)` so memory stays bounded and readers see the newest value, not a long backlog.
 
 ```swift
 func latestOnlyStream() -> AsyncStream<Int> {
@@ -648,9 +646,9 @@ func latestOnlyStream() -> AsyncStream<Int> {
 }
 ```
 
-### Timeout (race work vs sleep)
+### 7. Timeout — two tasks, first wins
 
-**Why a task group:** You race the real operation against a sleep that throws `CancellationError` (or a custom timeout error), then **cancel the rest** when one finishes first. **Advantage:** callers get a single `async throws` API with a time bound—useful for flaky networks when paired with sensible UX.
+**Rule:** Start the real work and a `Task.sleep` in the same `withThrowingTaskGroup`. Whichever finishes first wins; then call `cancelAll()` so the loser stops (sleep wakes as cancelled, work can check cancellation).
 
 ```swift
 func withTimeout<T: Sendable>(
